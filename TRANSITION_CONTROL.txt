@@ -1,0 +1,289 @@
+变形轮机器人：轮式平衡到足式稳定支撑
+适用目录：F:\bitbot-mujoco-demo
+
+1. 功能与使用范围
+
+本实现从轮式平衡出发，执行左右轮联合调相、保持 ATS 支撑的同步展开、
+ATO 接近地面、承载转移和足式稳定支撑。t / transform 是一次轮切足请求，
+不是模式 toggle；当前不实现足式到轮式的反向切换。
+
+控制器使用模型中的实际关节、闭链约束和地面接触，通过关节力矩/推力驱动。
+正常控制过程不直接改写正在运行的机器人 qpos，也不施加虚拟浮基支撑力。
+FootIK 的运动学计算使用独立参考数据，不等于直接移动实际机器人。
+
+当前适用范围为本工程给定模型、参数和水平地面的 MuJoCo 仿真。
+状态估计和接触观察含仿真真值，不代表任意地形、传感器误差或实体机器人
+条件已经验证。修改质量、闭链几何、摩擦、轮面或执行器能力后应重新测试。
+
+修改前文件备份位于 tmp/transition_before。恢复备份会撤销相应改动，
+不属于正常运行过程；日常复位使用关闭并重新启动后端。
+
+2. 构建与启动
+
+在项目根目录的 PowerShell 中执行：
+
+  cmake -S . -B build -DBITBOT_BUILD_BALANCE_TESTS=ON
+  cmake --build build --config Release --target main_app balance_smoke transition_smoke --parallel
+  .\build\bin\Release\main_app.exe
+
+已有 build 目录会复用其生成器和依赖配置。依赖来自工程 dependencies 中的
+本地压缩包。首次构建需要可用的 C++20 / MSVC 工具链和 CMake。
+
+也可以显式指定配置文件：
+
+  .\build\bin\Release\main_app.exe .\bitbot_w2tROBOT.xml
+
+程序启动后处于 kernel_idle；按 start 才开始推进物理仿真并进入 Balance。
+main_app 根据配置位置设置工作目录，日志默认写入项目 log 目录。
+
+3. 设置左右初始轮相位
+
+编辑 bitbot_w2tROBOT.xml 中下面两个 device 的 initial_pos（下列 30 度为示例，
+实际初值以当前配置文件为准）：
+
+  id="4"  name="rATS_pitch"  initial_pos='30'
+  id="9"  name="lATS_pitch"  initial_pos='30'
+
+这里转动关节 initial_pos 的单位是度；控制器内部采用 rad。
+修改配置后必须重新启动后端，当前进程不会自动重新加载这些值。
+不要把 models/w2tROBOT.xml 中的物理模型相位与此设备初始编码器角混为一谈。
+
+轮片相对地面的物理相位还包含机身、股骨和胫骨姿态。在当前直立附近、
+左右轴向和默认股骨 30 度、胫骨 -60 度的约定下：
+
+  物理相位 phi ≈ 机身 pitch - 股骨角 - 胫骨角 - ATS 编码器角
+               ≈ 31.49 度 - ATS initial_pos
+
+所以 initial_pos=30 度对应物理相位约 +1.49 度，而不是 +30 度；
+两侧 initial_pos=60 度则对应物理相位约 -28.51 度。
+如希望初始物理相位约 -5 度，可在该近似下设置 initial_pos≈36.49 度。
+若改了机身或腿部初始姿态，上面的 31.49 度常数也随之改变，应以运行时
+right_phase_deg / left_phase_deg 为准。相位以 360 度为周期，监控显示包角。
+
+仅测试初始相位时保留两侧 NUT initial_pos=0，避免把展开构型作为普通
+轮式启动条件。初始相位不同并不表示左右腿已经前后错位。
+
+4. 前端按键与运行流程
+
+按键应发送到 Bitbot 前端控制页；MuJoCo 窗口的自身快捷键不是这套事件入口。
+start、balance、transform 等用户动作按松键生效，长按不会反复初始化。
+
+  8 / start      从 kernel_idle 启动物理仿真，直接进入轮式 Balance。
+  t / transform  在有效轮式平衡中请求轮切足；重复请求不会重置正在执行的流程。
+  b / balance    从 waiting 请求重新平衡；只有仍处于未变形轮式状态且未锁存
+                 故障时允许，展开后不能用 b 强行退回轮式控制。
+  5 / waiting    清零执行器输出、解除主动控制，不是暂停并保持支撑。
+  空格 / stop    停止内核仿真。关闭窗口并重新启动后端恢复初始构型。
+  m              启用 CSV 记录，保存于 log/data；不是录制开关。
+
+正常操作顺序：启动后端 -> 8 -> 确认轮式平衡稳定 -> t -> 观察状态推进
+-> 足式支撑完成后继续观察接触和稳定指标。
+
+不要使用 MuJoCo Reset / Reload 来代替完整后端复位；设备初始化、控制器
+历史和模型数据需要一起恢复。stop 不会自动关闭窗口或结束后端进程。
+
+5. 控制方法与各阶段行为
+
+轮式 Balance 保留固定腿构型的原地平衡功能。请求切换后，阶段反馈使用
+标称轮腿倒立摆模型的离散 Riccati 解生成 LQR 增益，结合相位参考、速度、
+质心对应的平衡俯仰和俯仰角速度形成 ATS 共模控制，差模用于相位对齐。
+这是标称模型反馈及参考管理，不是全机器人非线性模型预测控制 NMPC。
+执行器输出设有力矩/推力限幅；ATS 和 NUT 另外设有命令变化率限制。
+调相 Align、展开 Unfold 和接近 Approach 三个阶段，在每侧 ATS 共模命令中
+加入速度误差积分形成的偏置，用于补偿离散轮面驻留等造成的小持续误差。
+Align 仅在左右平均相位误差绝对值不超过 15 度时接入积分，超过时清零，
+避免大范围调相期间积累偏置；这不是进入展开的相位门槛。
+偏置增益为 6.4 Nm/m，输出限幅正负 0.6 Nm，积分状态本身也限制在正负
+0.6/6.4 = 0.09375 m，避免只截断输出却继续累积造成的积分饱和。
+上次任一 ATS 命令达到轮端力矩限幅时冻结积分；这属于有限幅的积分补偿，
+不是完整的执行器饱和反算或摩擦辨识。Align 进入 Unfold 时清零积分；Unfold
+进入 Approach 时保留已有偏置，避免清零后重新长时间积累。Approach 首触前的
+积分累积速率为其余阶段的 3 倍（等效积分增益 19.2），已有偏置输出不乘 3，
+限幅仍为正负 0.6 Nm；首触后恢复原积分速率。原 Wheel 平衡分支仍使用既有
+PI 参数及抗饱和逻辑。
+
+调相名义目标为共同相位 -5 度、左右差相位接近 0。相位跨周时先统一连续
+分支，避免把 +175 / -175 度误判为必须相差 350 度。共同滚动改变平均相位，
+差动滚动改变左右相位差并允许机身偏航；当前流程不保证保留初始航向。
+
+每轮展开窗口为 [-7,-3] 度。窗口宽度不是可直接照搬的 4 度同步容差：
+进入展开仍要求两侧相对名义目标的误差各小于 1.8 度、差相小于 0.5 度、
+相位速度均小于 0.8 度/秒、两侧 ATS 法向力均大于 30 N、横滚小于 3 度、
+俯仰相对平衡值的误差小于 2 度，并连续满足超过 0.5 秒。积分补偿没有
+放宽这些门槛。展开推进时持续检查包含
+相位速度预测余量的窗口、ATS 承载及 ATO 净空，条件不满足则暂停推进。
+现有圆弧接触 mesh 以约 1 度离散，可能在小平面上出现驻留。控制器接受
+窗口内已经稳定的共同相位作为保持参考，不强迫实际角度刚性锁在 -5 度。
+保持参考仍允许平衡反馈工作，并不锁死 ATS 电机。
+
+展开时两侧螺母采用同一 0 -> 40.878 mm 参考，使用标称 8 秒的五次平滑
+轨迹，起止参考速度和加速度为零。参考由位置/速度反馈、积分补偿和限幅
+跟踪；保护条件不满足时暂停轨迹进度，所以实际展开时间可以大于 8 秒。
+到达指令末端不等于展开已经完成，还要检查两侧实际行程、速度及 ATO
+展开角接近 60 度等条件，并连续满足超过 0.4 秒后进入接近阶段。
+这里没有展开完成后再等待十多秒的定时器。
+
+接近、承载及 Hold 阶段，螺母使用闭链虚功估计的准静态保持推力前馈。估计使用
+闭链约束雅可比、偏置/被动力及接触反力，附带一致性检查、滤波与限幅。
+它不包含完整加速度惯性补偿，也不替代螺母位置闭环；末端关节限位反力
+不被当成应由前馈抵消的负载。
+
+主体展开完成后，两侧向足式接触相位靠近，残余差相位修正与接近过程协调。
+接近阶段共模请求速度上限为 12 mm/s。ATO 悬空、平均相位仍在触地目标之前时，
+使用不低于 4 mm/s 的爬行参考，避免相位比例项趋零造成再次驻留；最近一侧
+ATO 净空从 3 mm 降至 1 mm 时，请求上限平滑降至 4 mm/s。相位比例反馈本身也会
+在靠近目标时减速。常规速度参考变化率仍限制为 25 mm/s²，这些是参考值，不是
+对实际接触速度的硬保证。
+首次 ATO 接触后锁存减速状态，将共模参考限制到 1 mm/s，并同步参考斜率
+限制器的历史值；首触立即限速不受上述斜率限制，短暂卸载不重新启用快速接近。
+此时停止普通差动追相；差相位过大则
+进入保持分支。确认双侧有效接触后建立足式参考，初始化成功才进入承载
+过渡；FootIK 初始化失败则以 guard=4 进入 Hold。
+允许小的左右接触先后差，不把严格同时、零误差触地作为唯一成功条件。
+
+承载后的 FootIK 使用 14 维 box-QP：6 个浮基参考自由度和左右各 4 个
+主动转动关节。它在速度/关节位置边界内协调双足参考位姿、机身姿态、
+全身 CoM 水平位置与胸部高度；输出关节位置参考，再由力矩 PID 跟踪。
+QP 只处理运动学任务，不直接求接触力分配，不含动力学力矩或摩擦锥约束。
+参考解可行不等于实际支撑成立，最终必须看实际接触、CoM 与运动响应。
+当前 CoM 目标为相对双 ATS 轴中点沿机身前向移动至 +25 mm，位于支撑域内，
+并非强制移到几何中心；这一保守位置兼顾螺母保持推力。胸高目标取切换请求时
+的实测高度。改变目标前应同时检查实际支撑裕量、关节范围和 NUT 负载。
+质心参考仅在两侧螺母距末端的误差均小于 0.4 mm、两侧 ATS 法向力均大于
+15 N、两侧 NUT 推力命令绝对值均小于 112 N 时推进，其余情况下保持进度。
+这一推进条件不要求 ATO 始终承载，允许初触后的短暂 ATO 卸载，避免
+“质心未前移所以 ATO 未承载、ATO 未承载所以质心不前移”的相互等待。
+这并不取消双侧初触确认或最终足式承载验收。ATS 从平衡反馈向足式阻抗的
+混合权重仍根据 ATO 承载与支撑裕量调整，不按固定时刻直接撤去平衡控制。
+
+最终验收使用实际 ATS/ATO 支撑力、接触点构成的支撑域、CoM 裕量、
+胸高、姿态/速度及螺母保持误差，并要求持续稳定。ATO 承载不要求把 ATS
+支撑力强行降为零；当前足式支撑允许 ATS 和 ATO 共同承载。
+
+6. 控制台脚本与监控
+
+后端运行时，在另一个 PowerShell 中从项目根目录执行：
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/robot_console.ps1 -Action start
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/robot_console.ps1 -Action status
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/robot_console.ps1 -Action transform -WatchSeconds 20
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/robot_console.ps1 -Action status -WatchSeconds 60 -IntervalMs 500
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/robot_console.ps1 -Action stop
+
+批处理读取可加 -AsJson，连续观察时每行输出一个 JSON 对象：
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/robot_console.ps1 -Action status -AsJson
+
+上述 -ExecutionPolicy Bypass 只作用于本次启动的 PowerShell 进程，不修改
+系统或当前用户的永久执行策略；-NoProfile 避免个人启动配置影响批处理输出。
+
+脚本还支持 balance / waiting / record。非默认端口使用 -Port，例如
+-Port 12889，且应与配置 XML 中端口一致。脚本只连接 127.0.0.1 上既有后端，
+不新开服务器、不抢占前端客户端，也不直接跨线程写入控制器事件队列。
+退出观察、超时或 Ctrl+C 只关闭该客户端连接，不隐式解除机器人控制。
+
+start / stop 等命令会检查实际内核状态。transform 成功发出仅表示事件
+已发送，应继续检查 transition_stage、transition_guard 和 fault_code，
+不能把脚本正常退出当作轮切足完成。
+
+transition_stage 阶段编号：
+  0  wheel_balance      轮式平衡，尚未执行轮切足。
+  1  phase_alignment    联合调相，准备进入展开窗口。
+  2  unfolding          螺母推进及主体展开。
+  3  contact_approach    展开完成后的接近地面。
+  4  load_transfer      承载过渡与 CoM / 胸高参考调整。
+  5  foot_support       已通过持续稳定判据，保持足式支撑。
+  6  recovery_hold      停止正常流程推进的保持分支，不表示已完成切换。
+
+transition_guard 与 fault_code 是不同的诊断字段。当前 guard 编码为：
+  0  无当前阶段保护标志；不代表切换已经完成。
+  1  展开推进条件不满足：相位/预测余量、ATS 承载、ATO 净空或轻微接触
+     条件未满足。暂停螺母参考进度，条件恢复后可继续。
+  2  非终态单阶段持续超过 100 秒仿真时间，进入 recovery_hold。
+  3  接触时序或相位异常，进入 recovery_hold：展开阶段任一 ATO 滤波
+     法向力超过 3 N；或接近阶段已检测首触，剩余差相位仍大于 0.8 度。
+  4  FootIK 初始化或更新失败。建立足式参考时初始化失败会直接进入 Hold；
+     运行中更新失败则保留上次有效关节参考，仅在之后一次新的 QP 成功
+     更新时清除该码，未到更新周期的正常保持调用不会将它清除。
+     更新失败标志持续存在时，会触发下面的支撑退化保护。
+  5  承载/足式支撑退化持续超过 0.3 秒，进入 recovery_hold。触发条件
+     包括任一 ATS 法向力低于 3 N、任一 NUT 行程误差超过 1 mm 或 IK
+     持续失败；已进入 Foot 后，还检查 ATO 法向力低于 2 N 或支撑裕量
+     小于 2 mm。
+
+recovery_hold 停止正常展开/靠近进度和普通差动追相，保留已有闭环输出。
+Hold 内继续尝试更新有效的 NUT 保持推力前馈；ATO 承载或支撑裕量下降时，
+下调踝关节的足式阻抗混合权重，增加保留的平衡反馈比例，不恢复普通调相。
+它不是零力矩 waiting，也不表示已自动恢复安全支撑；当前不提供从 Hold
+自动重新启动切换的路径，需检查日志并关闭、重启后端。不要反复发送 t
+强行推进。保护阈值均为当前仿真模型的控制参数，不是硬件安全额定值。
+
+fault_code 沿用内核控制保护：0 正常，1 非有限传感器值，2 姿态超限，
+3 超速，4 控制时钟异常；锁存故障后需重新启动后端。
+
+主要监测字段：
+  right_phase_deg / left_phase_deg / phase_difference_deg：物理轮相位及差值。
+  nut_target_m / right_nut_m / left_nut_m：螺母参考与实测，单位 m。
+  right_ato_deg / left_ato_deg：ATO 相对展开角，单位度。
+  right_ATS_N / left_ATS_N / right_ATO_N / left_ATO_N：滤波后的实际法向力。
+  com_forward_m：相对左右 ATS 轴中点、沿机身前向的全身 CoM 偏移。
+  support_margin_m：实际接触支撑凸包相对 CoM 投影的裕量；接触不足时
+                    可返回无有效面积的标志值，轮式阶段不应据此判为足式失败。
+  chest_height_m：IMU site 对应的胸部测量高度，不等同于 CoM 高度。
+  right_wheel_Nm / left_wheel_Nm：ATS 关节侧力矩命令，并非传感器测得的力矩。
+
+7. 无界面测试与结果边界
+
+测试复用正式模型与控制源码。以下为可复现命令，不构成预先宣称测试通过：
+
+  .\build\bin\Release\balance_smoke.exe --scenario all --duration 10
+  .\build\bin\Release\transition_smoke.exe --scenario configured --duration 90 --csv build/transition_configured.csv
+  .\build\bin\Release\transition_smoke.exe --scenario ats_60 --duration 90 --csv build/transition_ats_60.csv
+  .\build\bin\Release\transition_smoke.exe --scenario all --duration 90
+
+单项轮切足场景可选 configured、common_90、opposite、wrap_boundary、
+near_window、ats_60。common_90 至 near_window 四项设置指定物理相位，
+用于测试共同大相位、反相、跨周和窗口边缘情况；configured 使用配置文件
+的初始姿态。ats_60 固定左右 ATS 原始编码器角均为 60 度，复现该启动构型；
+--scenario all 包含上述六项，不包含单独的 ik_failure 保护测试。
+
+另有单独的保护路径测试（也注册为 CTest 的 transition_ik_failure）：
+
+  .\build\bin\Release\transition_smoke.exe --case ik_failure
+
+它在 Foot 状态下移除 IK 参考生成器，验证持续不可用会转入 Hold，并继续保持
+已有支撑输出；这不是所有 QP 数值故障或所有失去接触情形的穷举验证。
+
+指定一组物理相位的例子：
+
+  .\build\bin\Release\transition_smoke.exe --scenario configured --right-phase-deg 90 --left-phase-deg -90 --duration 90 --csv build/transition_custom.csv
+
+测试参数 --right-phase-deg / --left-phase-deg 是物理相位（度），不同于
+bitbot_w2tROBOT.xml 的 ATS initial_pos 编码器角。
+
+直接指定原始 ATS 编码器初值的例子（不改配置文件）：
+
+  .\build\bin\Release\transition_smoke.exe --scenario configured --right-ats-deg 60 --left-ats-deg 60 --duration 90 --csv build/transition_encoder_60.csv
+
+--right-ats-deg / --left-ats-deg 与配置 initial_pos 的角度含义相同，保留所给
+编码器周数；例如 60 和 420 度有相同物理朝向，但编码器初值不同。同一侧
+不能同时指定 --*-phase-deg 和 --*-ats-deg。未覆盖的一侧仍使用配置值。
+自定义初值可用于 configured 或 ik_failure；用于 all 时只覆盖 configured，
+不会改写其余命名回归场景。--request-time 控制仿真
+开始多久后请求切换，--hold-time 控制末尾稳定保持的验收时段。
+CSV 只支持单项场景，不与 --scenario all 同用。
+
+CTest 入口为：
+
+  ctest --test-dir build -C Release --output-on-failure
+
+轮切足测试当前默认每项 90 秒、开始后 3 秒请求切换、末尾 10 秒验收保持；
+需要其他观察时间时，使用直接运行命令显式指定 --duration。判断结果须
+同时看进程退出码、PASS/FAIL 和末尾实际支撑验收，不应仅以日志出现
+foot_support 为结论。
+
+接近触地停顿修复及本版验证见 tests/approach_latency_validation.txt。
+60 度调相停滞修复及此前相位覆盖验证见 tests/phase_alignment_validation.txt。
+上一版 11 场景的历史结果与接触过渡分析见 tests/transition_validation.txt；
+修改控制器后的具体完成时刻应以最新记录为准。
+本说明不把有限场景结果当作全部初始相位、地形与扰动下的性能保证。

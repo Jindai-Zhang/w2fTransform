@@ -1,0 +1,10 @@
+{
+  "control": [
+    { "event": "start",          "kb_key": "8" },
+    { "event": "balance",        "kb_key": "b" },
+    { "event": "transform",      "kb_key": "t" },
+    { "event": "waiting",        "kb_key": "5" },
+    { "event": "stop",           "kb_key": " " },
+    { "event": "enable_record",  "kb_key": "m" }
+  ]
+}
